@@ -1,142 +1,245 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+import requests
+import json
 import time
+import uuid
+import random
+import hashlib
 import threading
 from flask import Flask, request, jsonify, Response
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import argostranslate.package
-import argostranslate.translate
+API_URL      = "https://api.translasion.com/enhance/dictionary"
+API_KEY      = "eb298ebd8ac6c5c6c34d0fab40b871dc"
+APP_KEY_SIG  = "3be659f52e8f"
+BODY_APP_KEY = "aa466fe2a01b"
+PKG          = "com.zaz.translate"
+PKG_SIGN     = "61ed377e85d386a8dfee6b864bd85b0bfaa5af81"
+VERSION_NAME = "6.2.0.003.gp"
+VERSION_CODE = "2026083103"
+APP_VERSION  = "6.2.0"
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PACKAGES_DIR = os.path.join(APP_DIR, "packages")
-os.makedirs(PACKAGES_DIR, exist_ok=True)
+DEVICES = [
+    ("TECNO TECNO LJ9",  "TECNO"),
+    ("TECNO TECNO CM7",  "TECNO"),
+    ("TECNO TECNO KI5",  "TECNO"),
+    ("Samsung SM-G998B", "samsung"),
+    ("Samsung SM-A536B", "samsung"),
+    ("Samsung SM-S918B", "samsung"),
+    ("Xiaomi 2201123G",  "Xiaomi"),
+    ("Xiaomi M2101K7AG", "Xiaomi"),
+    ("Redmi 21091116AG", "Xiaomi"),
+    ("POCO 2207117BPG",  "Xiaomi"),
+    ("HUAWEI ELS-NX9",   "HUAWEI"),
+    ("HUAWEI VOG-L29",   "HUAWEI"),
+    ("HONOR BVL-N49",    "HONOR"),
+    ("OPPO CPH2451",     "OPPO"),
+    ("OnePlus CPH2449",  "OnePlus"),
+    ("vivo V2148A",      "vivo"),
+    ("realme RMX3630",   "realme"),
+    ("Google Pixel 7",   "google"),
+    ("Google Pixel 8",   "google"),
+    ("motorola moto g62","motorola"),
+    ("Nokia G21",        "HMD Global"),
+    ("Sony XQ-DQ72",     "Sony"),
+    ("Nothing A063",     "Nothing"),
+    ("Infinix X6819",    "Infinix"),
+    ("ASUS_AI2202",      "asus"),
+    ("LG LM-G910",       "LGE"),
+]
 
-ARABIC_CODE = "ar"
-ENGLISH_CODE = "en"
+USER_AGENTS = [
+    "okhttp/5.1.0",
+    "okhttp/4.12.0",
+    "okhttp/4.11.0",
+    "okhttp/4.10.0",
+    "okhttp/4.9.3",
+    "Dalvik/2.1.0 (Linux; U; Android 16; TECNO CM7 Build/BP2A.250605.031.A3)",
+    "Dalvik/2.1.0 (Linux; U; Android 15; SM-S918B Build/AP3A.240905.015)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Build/AP1A.240505.005)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; SM-A536B Build/TP1A.220624.014)",
+]
 
-_installed_languages = {}
-_install_lock = threading.Lock()
-_init_done = False
+TIMEZONES = [
+    "Asia/Baghdad", "Asia/Riyadh", "Asia/Dubai", "Asia/Kuwait",
+    "Asia/Qatar", "Asia/Amman", "Asia/Beirut", "Africa/Cairo",
+    "Europe/London", "Europe/Paris", "Europe/Berlin",
+    "Asia/Tokyo", "Asia/Seoul", "Asia/Istanbul",
+]
+
+DEVICE_LANGS = [
+    "ar-IQ", "ar-SA", "ar-EG", "ar-AE", "ar-KW", "ar-JO",
+    "en-US", "en-GB", "fr-FR", "de-DE", "es-ES", "tr-TR",
+    "fa-IR", "ur-PK", "ru-RU", "zh-CN", "ja-JP", "ko-KR", "hi-IN",
+]
+
+ALPHANUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
-def _ensure_packages_dir():
-    try:
-        from argostranslate import settings
-        settings.package_dir = PACKAGES_DIR
-    except Exception:
-        pass
+class Translator:
+    def __init__(self, rotate_every=100):
+        self.session      = self._build_session()
+        self.install_id   = self._rand_id()
+        self.rotate_every = rotate_every
+        self.counter      = 0
+        self.lock         = threading.Lock()
+        self.stats        = {"ok": 0, "err": 0, "blocked": 0}
 
+    @staticmethod
+    def _build_session():
+        s = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=30,
+            pool_maxsize=100,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        return s
 
-def _download_and_install(from_code, to_code):
-    key = f"{from_code}_{to_code}"
-    if key in _installed_languages:
-        return _installed_languages[key]
+    @staticmethod
+    def _rand_id():
+        return ''.join(random.choice(ALPHANUM) for _ in range(22))
 
-    with _install_lock:
-        if key in _installed_languages:
-            return _installed_languages[key]
+    def _rotate(self):
+        with self.lock:
+            self.counter += 1
+            if self.counter % self.rotate_every == 0:
+                self.install_id = self._rand_id()
+                if self.counter % (self.rotate_every * 3) == 0:
+                    self.session = self._build_session()
 
+    def _headers(self):
+        ts    = int(time.time())
+        uid   = str(uuid.uuid4())
+        nonce = str(random.randint(1000, 9999))
+        sig   = hashlib.md5(
+            f"{APP_KEY_SIG}&{ts}&{uid}&{nonce}".encode()
+        ).hexdigest()
+        device, brand = random.choice(DEVICES)
+        return {
+            'User-Agent'        : random.choice(USER_AGENTS),
+            'Accept-Encoding'   : "identity",
+            'api-key'           : API_KEY,
+            'package-name'      : PKG,
+            'package-sign'      : PKG_SIGN,
+            'app-key'           : APP_KEY_SIG,
+            'x-install-id'      : self.install_id,
+            'timestamp'         : str(ts),
+            'sig'               : sig,
+            'nonce'             : nonce,
+            'uuid'              : uid,
+            'app_version'       : APP_VERSION,
+            'x-package-name'    : PKG,
+            'x-version-name'    : VERSION_NAME,
+            'x-version-code'    : VERSION_CODE,
+            'x-device'          : device,
+            'x-brand'           : brand,
+            'x-timezone'        : random.choice(TIMEZONES),
+            'x-device-language' : random.choice(DEVICE_LANGS),
+            'to'                : "ar",
+            'content-type'      : "application/json; charset=UTF-8",
+        }
+
+    def _send(self, payload, retries=2):
+        for _ in range(retries + 1):
+            try:
+                r = self.session.post(
+                    API_URL,
+                    data=json.dumps(payload),
+                    headers=self._headers(),
+                    timeout=8,
+                )
+                if r.status_code in (429, 403):
+                    self.stats["blocked"] += 1
+                    self.install_id = self._rand_id()
+                    time.sleep(1.5 + random.random())
+                    continue
+                return r.json()
+            except (requests.Timeout, requests.ConnectionError):
+                time.sleep(0.5)
+                continue
+            except Exception:
+                return {"code": -1, "message": "exception"}
+        return {"code": -1, "message": "max retries"}
+
+    def translate(self, text, to_lang="ar"):
+        if not text or not text.strip():
+            return {"ok": True, "translated": text, "source": text}
+
+        self._rotate()
+
+        payload = {
+            "app_key"           : BODY_APP_KEY,
+            "from"              : "auto",
+            "gpt_switch"        : "0",
+            "override_from_flag": "0",
+            "scene"             : 100,
+            "system_lang"       : "ar",
+            "to"                : to_lang,
+            "word"              : text,
+        }
+
+        data = self._send(payload)
+        if data.get("code") == 1000:
+            self.stats["ok"] += 1
+            translated = data["data"].get("translated") or text
+            return {"ok": True, "translated": translated, "source": text}
+
+        self.stats["err"] += 1
+        return {
+            "ok": False,
+            "translated": None,
+            "source": text,
+            "error": data.get("message"),
+        }
+
+    def translate_str(self, text, to_lang="ar"):
+        r = self.translate(text, to_lang)
+        return r["translated"] if r["ok"] else None
+
+    def close(self):
         try:
-            argostranslate.package.update_package_index()
-            available = argostranslate.package.get_available_packages()
-
-            pkg = next(
-                (p for p in available
-                 if p.from_code == from_code and p.to_code == to_code),
-                None
-            )
-
-            if pkg is None:
-                print(f"⚠️  لا يوجد نموذج مباشر: {from_code} → {to_code}")
-                return None
-
-            print(f"⬇️  جاري تحميل نموذج {from_code} → {to_code} ...")
-            download_path = pkg.download()
-            argostranslate.package.install_from_path(download_path)
-            print(f"✅ تم تثبيت نموذج {from_code} → {to_code}")
-
-            _installed_languages[key] = True
-            return True
-
-        except Exception as e:
-            print(f"❌ فشل تثبيت {from_code} → {to_code}: {e}")
-            return None
+            self.session.close()
+        except Exception:
+            pass
 
 
-def _get_installed_pairs():
-    try:
-        langs = argostranslate.translate.get_installed_languages()
-        pairs = {}
-        for lang in langs:
-            for t in lang.translations_from:
-                pairs[f"{lang.code}_{t.to_lang.code}"] = True
-        return pairs
-    except Exception:
-        return {}
+_engine = None
+_lock = threading.Lock()
 
 
-def _translate(text, from_code, to_code):
-    if not text or not text.strip():
-        return text
-
-    if from_code == to_code:
-        return text
-
-    try:
-        langs = argostranslate.translate.get_installed_languages()
-        from_lang = next((l for l in langs if l.code == from_code), None)
-        to_lang = next((l for l in langs if l.code == to_code), None)
-
-        if not from_lang or not to_lang:
-            return None
-
-        translation = from_lang.get_translation(to_lang)
-        if translation is None:
-            return None
-
-        return translation.translate(text)
-    except Exception as e:
-        print(f"خطأ ترجمة: {e}")
-        return None
+def get_translator():
+    global _engine
+    if _engine is None:
+        with _lock:
+            if _engine is None:
+                _engine = Translator()
+    return _engine
 
 
-def init_languages():
-    global _init_done
-    if _init_done:
-        return
-
-    _ensure_packages_dir()
-
-    print("🚀 جاري تهيئة نماذج الترجمة (قد يأخذ وقتاً في المرة الأولى)...")
-    _download_and_install(ENGLISH_CODE, ARABIC_CODE)
-    _download_and_install(ARABIC_CODE, ENGLISH_CODE)
-    _download_and_install("fr", ARABIC_CODE)
-    _download_and_install("de", ARABIC_CODE)
-    _download_and_install("es", ARABIC_CODE)
-    _download_and_install("tr", ARABIC_CODE)
-    _download_and_install("ru", ARABIC_CODE)
-    _download_and_install("zh", ARABIC_CODE)
-    _download_and_install("ja", ARABIC_CODE)
-
-    _init_done = True
-    print("✅ جميع النماذج جاهزة!")
+@lru_cache(maxsize=10000)
+def translate_cached(text, to_lang="ar"):
+    return get_translator().translate_str(text, to_lang)
 
 
-@lru_cache(maxsize=5000)
-def translate_cached(text, from_code="en", to_code=ARABIC_CODE):
-    return _translate(text, from_code, to_code)
-
-
-def translate_batch(texts, from_code="en", to_code=ARABIC_CODE, workers=4):
+def translate_batch(texts, workers=8):
     results = [None] * len(texts)
 
     def task(i, text):
         try:
-            return i, translate_cached(text, from_code, to_code)
+            return i, translate_cached(text)
         except Exception:
             return i, None
 
@@ -236,6 +339,9 @@ HTML_PAGE = """<!DOCTYPE html>
     .batch-actions .btn { margin-top: 0; }
     .btn-ghost { background: #f0f0f0; color: #333; }
     .btn-ghost:hover { background: #e0e0e0; box-shadow: none; }
+    .progress { margin-top: 15px; height: 8px; background: #eee; border-radius: 4px; overflow: hidden; display: none; }
+    .progress.show { display: block; }
+    .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #667eea, #764ba2); transition: width 0.3s; }
     .info { margin-top: 12px; padding: 10px; background: #fffbea; border-right: 4px solid #f6c23e; border-radius: 8px; font-size: 0.85em; color: #7a5c00; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 </style>
@@ -281,6 +387,10 @@ HTML_PAGE = """<!DOCTYPE html>
             <button class="btn btn-ghost" onclick="copyResults()">نسخ النتائج</button>
         </div>
 
+        <div class="progress" id="progress">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+
         <div id="batchResult"></div>
         <div class="status" id="batchStatus"></div>
     </div>
@@ -297,6 +407,8 @@ const batchInput  = document.getElementById('batchInput');
 const batchBtn    = document.getElementById('batchBtn');
 const batchStatus = document.getElementById('batchStatus');
 const batchResult = document.getElementById('batchResult');
+const progress    = document.getElementById('progress');
+const progressBar = document.getElementById('progressBar');
 
 let lastResults = [];
 
@@ -380,6 +492,8 @@ async function doBatchTranslate() {
     batchBtn.textContent = 'جاري الترجمة...';
     batchStatus.textContent = '';
     batchResult.innerHTML = '';
+    progress.classList.add('show');
+    progressBar.style.width = '0%';
     lastResults = [];
 
     const t0 = Date.now();
@@ -395,6 +509,8 @@ async function doBatchTranslate() {
         const dt = Date.now() - t0;
 
         if (!data.ok) { batchStatus.textContent = '❌ ' + (data.error || 'فشلت الترجمة'); return; }
+
+        progressBar.style.width = '100%';
 
         let html = '<table><tr><th>#</th><th>الأصل</th><th>الترجمة</th></tr>';
         data.results.forEach((item, i) => {
@@ -443,7 +559,6 @@ def api_translate():
     try:
         data = request.get_json() or {}
         text = (data.get("text") or "").strip()
-        from_code = (data.get("from") or "en").strip()
 
         if not text:
             return jsonify({"ok": False, "error": "النص فارغ"}), 400
@@ -451,12 +566,12 @@ def api_translate():
         if len(text) > 5000:
             text = text[:5000]
 
-        result = translate_cached(text, from_code, ARABIC_CODE)
+        result = translate_cached(text)
 
         if result:
             return jsonify({"ok": True, "translated": result, "source": text})
 
-        return jsonify({"ok": False, "error": "لا يوجد نموذج لهذه اللغة"}), 500
+        return jsonify({"ok": False, "error": "فشلت الترجمة"}), 500
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -466,7 +581,6 @@ def api_translate_batch():
     try:
         data = request.get_json() or {}
         texts = data.get("texts") or []
-        from_code = (data.get("from") or "en").strip()
 
         if not isinstance(texts, list) or len(texts) == 0:
             return jsonify({"ok": False, "error": "لم يتم إرسال نصوص"}), 400
@@ -476,7 +590,7 @@ def api_translate_batch():
 
         texts = [(t or "").strip()[:5000] for t in texts]
 
-        translated = translate_batch(texts, from_code, ARABIC_CODE, workers=4)
+        translated = translate_batch(texts, workers=8)
 
         results = [
             {"source": texts[i], "translated": translated[i]}
@@ -488,12 +602,10 @@ def api_translate_batch():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/api/languages")
-def api_languages():
-    pairs = _get_installed_pairs()
-    return jsonify({"ok": True, "installed": list(pairs.keys())})
+@app.route("/api/stats")
+def api_stats():
+    return jsonify(get_translator().stats)
 
 
 if __name__ == "__main__":
-    init_languages()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
